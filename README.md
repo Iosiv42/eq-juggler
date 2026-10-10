@@ -9,7 +9,6 @@ What it can do now:
 ## Installation
 ```bash
 pip install -r requirements.txt
-pip install pyloudnorm
 ```
 
 ## How to setup
