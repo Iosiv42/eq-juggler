@@ -1,10 +1,20 @@
 # EQ Juggler (MVP)
 Load different EQ presets (in APO syntax) and compare them. Presets are loudness matched automatically.
 By now you need to manually set it and program's capabilities are limited because it's MVP. You also need to manually connect Pipewire's node of EQ Juggler between some stream or source (or make EQ Juggler to act as default sink) to desired sink (headphones output, audio interface, Bluetooth, etc.). Program is only intended to be used with Pipewire and pipewire-jack as it is work as Jack client.
+
 What it can do now:
+
 * Apply different EQ presets to incoming audio stream from some node\[s\] and output it to other node\[s\]
 * Loudness match all EQ presets so their perceived loudness is the same
 * Change between EQ presets seamlessly
+
+What is planed to add:
+
+* EQ magnitude response preview
+* Interactive EQ editing
+* Blind comparison of EQ presets either by uploaded file or by incoming stream
+* Rank EQ presets using Bradley–Terry model
+* EQ for channel matching
 
 ## Installation
 ```bash
