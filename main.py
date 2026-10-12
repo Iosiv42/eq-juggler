@@ -63,8 +63,9 @@ p2 = eq_apo_parser.parse_eq_apo_config("/home/paro/Downloads/JT1/PEQdB Pref norm
 p3 = eq_apo_parser.parse_eq_apo_config("/home/paro/Downloads/JT1/PEQdB pref 10.10.2026.txt", 48000, "pref today")
 p4 = eq_apo_parser.parse_eq_apo_config("/home/paro/Downloads/JT1/PEQdB pref 2 10.10.2026.txt", 48000, "pref today 2")
 p5 = eq_apo_parser.parse_eq_apo_config("/home/paro/Downloads/JT1/avg peq pref 10.10.2026.txt", 48000, "avg pref")
+p6 = eq_apo_parser.parse_eq_apo_config("", 48000, "original")
 
-ps = [p1, p2, p3, p4, p5]
+ps = [p1, p2, p3, p4, p5, p6]
 
 #
 # Now is the presets loudness matching. It is simplified/generalized version.
@@ -92,6 +93,7 @@ for p, l in zip(ps, ps_loudnesses):
 
 # Start the jack thread
 jack_client.peq_cfg = ps[0]
+jack_client.presets = ps
 t = threading.Thread(target=jack_client.start_jack)
 t.start()
 
@@ -103,23 +105,124 @@ for p in ps:
 
 dpg.create_context()
 
+radio_buttons = []
+active_button = None
+is_bypass = False
+
+with dpg.theme() as active_theme:
+    with dpg.theme_component(dpg.mvAll):
+        dpg.add_theme_color(dpg.mvThemeCol_Button, (0, 128, 128, 255))
+        dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (0, 160, 160, 255))
+        dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (0, 100, 100, 255))
+
+with dpg.theme() as power_button_theme:
+    with dpg.theme_component(dpg.mvAll):
+        dpg.add_theme_color(dpg.mvThemeCol_Button, (0, 128, 128, 0))
+        dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (0, 160, 160, 0))
+        dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (0, 100, 100, 0))
+        power_button_text_color_prop = dpg.add_theme_color(dpg.mvThemeCol_Text, (255, 0, 0, 255))
+
+with dpg.theme() as power_button_on_theme:
+    with dpg.theme_component(dpg.mvAll):
+        dpg.add_theme_color(dpg.mvThemeCol_Button, (0, 128, 128, 0))
+        dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (0, 160, 160, 0))
+        dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (0, 100, 100, 0))
+        dpg.add_theme_color(dpg.mvThemeCol_Text, (0, 255, 0, 255))
+
 def button_callback(sender, app_data, user_data):
+    global active_button
+
+    if active_button is not None:
+        dpg.bind_item_theme(active_button, 0)
+
+    dpg.bind_item_theme(sender, active_theme)
+    active_button = sender
+
     with jack_client.peq_cfg_lock:
-        jack_client.peq_cfg = next(filter(lambda p: p.name == app_data, ps))
+        jack_client.peq_cfg = next(filter(lambda p: p.name == user_data, ps))
+
+def power_button_callback(sender, app_data, user_data):
+    global is_bypass
+    is_bypass = not is_bypass
+
+    with jack_client.peq_cfg_lock:
+        jack_client.is_bypass = is_bypass
+
+    if is_bypass:
+        dpg.configure_item(power_button_text_color_prop, value=(255, 0, 0))
+    else:
+        dpg.configure_item(power_button_text_color_prop, value=(0, 255, 0))
+
+def power_button_on_hover(sender, app_data):
+    global is_bypass
+    if is_bypass:
+        dpg.configure_item(power_button_text_color_prop, value=(128, 0, 0, 255))
+    else:
+        dpg.configure_item(power_button_text_color_prop, value=(0, 128, 0, 255))
+
+def power_button_on_unhover(sender, app_data):
+    global is_bypass
+    if is_bypass:
+        dpg.configure_item(power_button_text_color_prop, value=(0, 0, 0, 255))
+    else:
+        dpg.configure_item(power_button_text_color_prop, value=(0, 0, 0, 255))
+
+def update_spacer_width():
+    viewport_width = dpg.get_viewport_width()
+    button_width = dpg.get_item_width("power_button")
+    spacer_width = viewport_width - button_width - 20
+    dpg.set_item_width("menu_bar_spacer", spacer_width * (spacer_width >= 0))
+
+with dpg.font_registry():
+    with dpg.font("/usr/share/fonts/TTF/BlexMonoNerdFont-Regular.ttf", 18) as nerd_font:
+        pass
+
+dpg.bind_font(nerd_font)
 
 with dpg.window(tag="Primary Window"):
-    dpg.add_radio_button(
-        items=tuple(p.name for p in ps),
-        default_value=ps[0].name,
-        callback=button_callback,
-        tag="my_radio"
-    )
+    with dpg.menu_bar():
+        dpg.add_spacer(width=1, tag="menu_bar_spacer")
+        power_btn = dpg.add_button(label="⏻", tag="power_button", width=25, callback=power_button_callback)
+        dpg.bind_item_theme(power_btn, power_button_theme)
+
+    for p in ps:
+        btn = dpg.add_button(
+            label=p.name, user_data=p.name,
+            callback=button_callback,
+            width=-1, height=100
+        )
+
+        radio_buttons.append(btn)
+
+    active_button = radio_buttons[0]
+    dpg.bind_item_theme(active_button, active_theme)
+
+with dpg.item_handler_registry() as handler_registry:
+    dpg.add_item_hover_handler(callback=power_button_on_hover)
+    # dpg.add_item_visible_handler(callback=power_button_on_unhover)
+
+dpg.bind_item_handler_registry(power_btn, handler_registry)
 
 dpg.create_viewport(title='EQ Juggler', width=800, height=600,)
 dpg.setup_dearpygui()
 dpg.show_viewport()
+dpg.set_viewport_resize_callback(update_spacer_width)
 dpg.set_primary_window("Primary Window", True)
-dpg.start_dearpygui()
+
+update_spacer_width()
+
+
+while dpg.is_dearpygui_running():
+    # If the button is no longer hovered, reset the color to white.
+    # This acts as the "on_leave" fallback because Dear PyGui lacks a native leave handler.
+    if not dpg.is_item_hovered(power_btn):
+        if is_bypass:
+            dpg.configure_item(power_button_text_color_prop, value=(255, 0, 0, 255))
+        else:
+            dpg.configure_item(power_button_text_color_prop, value=(0, 255, 0, 255))
+
+    dpg.render_dearpygui_frame()
+
 dpg.destroy_context()
 jack_client.event.set()
 t.join()

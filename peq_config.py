@@ -51,11 +51,14 @@ class PEQConfig:
 
 
     def apply_inplace(self, samples, filters_zi):
-        clib_apply_peq.apply_inplace(
-            self.filters_b, self.filters_a,
-            samples, filters_zi,
-            len(self.filters), len(samples)
-        )
+        try:
+            clib_apply_peq.apply_inplace(
+                self.filters_b, self.filters_a,
+                samples, filters_zi,
+                len(self.filters), len(samples)
+            )
+        except ctypes.ArgumentError:
+            pass
 
         samples *= self._preamp_gain_lin
 

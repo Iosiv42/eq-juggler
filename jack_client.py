@@ -12,10 +12,15 @@ acoustical feedback!
 import os
 import jack
 import threading
+import numpy as np
 
-peq_cfg = None
+from peq_config import PEQConfig
+
+peq_cfg: PEQConfig | None = None
 peq_cfg_lock = threading.RLock()
+presets: list[PEQConfig] | None = None
 client_started_event = threading.Event()
+is_bypass = False
 
 
 def start_jack():
@@ -42,14 +47,30 @@ def start_jack():
     def process(frames):
         global peq_cfg
         global peq_cfg_lock
+        global presets
+        global is_bypass
 
         assert len(client.inports) == len(client.outports)
         assert frames == client.blocksize
-        for i, o, channel_filters_zi in zip(client.inports, client.outports, peq_cfg.zi):
-            with peq_cfg_lock:
-                new_buf, new_zi = peq_cfg.apply_inplace(i.get_array(), channel_filters_zi)
-            o.get_array()[:] = new_buf
-            channel_filters_zi[:] = new_zi
+
+        with peq_cfg_lock:
+            if is_bypass:
+                for i, o in zip(client.inports, client.outports):
+                    o.get_buffer()[:] = i.get_buffer()
+
+                return
+
+            for idx, (i, o) in enumerate(zip(client.inports, client.outports)):
+                buf = i.get_array()
+                for p in presets:
+                    new_buf, new_zi = p.apply_inplace(np.copy(buf), p.zi[idx])    # TODO
+                    if p.name == peq_cfg.name:
+                        o.get_array()[:] = new_buf
+                    p.zi[idx][:] = new_zi
+
+                # new_buf, new_zi = peq_cfg.apply_inplace(i.get_array(), channel_filters_zi)
+                # o.get_array()[:] = new_buf
+                # channel_filters_zi[:] = new_zi
 
 
     @client.set_shutdown_callback
