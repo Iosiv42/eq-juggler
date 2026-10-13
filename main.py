@@ -1,12 +1,16 @@
 import dearpygui.dearpygui as dpg
 import threading
+import subprocess
 
 import jack
+from scipy._external.array_api_extra import default_dtype
 
 import eq_apo_parser
 import jack_client
 import numpy as np
 import pyloudnorm as pyln
+import node_auto_connect
+import copy
 
 
 def generate_tilted_noise(num_samples, db_per_octave, fs=44100):
@@ -67,33 +71,8 @@ p6 = eq_apo_parser.parse_eq_apo_config("", 48000, "original")
 
 ps = [p1, p2, p3, p4, p5, p6]
 
-#
-# Now is the presets loudness matching. It is simplified/generalized version.
-# It just compares loudness of the same noise but with different presets
-# applied. After it preamp gains are lessened to match the quitest one. It's
-# chosen because as by now program only works as equalizer that captures
-# samples from the inports of the node, applies dsp to them and outputs them to
-# the outports of the node. Noise is specified by it's tilt in dB/octave. -3 is
-# pink noise, -4.5 is chosen as default because many popular music has tilt
-# spectal tilt of -4.5 dB/octave. One can also experiment with filter class of
-# `meter`: "K-weighting", "Fenton/Lee 1", etc.
-#
-noise_tilt = -4.5
-reference_signal = generate_tilted_noise(48000 * 60, noise_tilt, 48000)
-meter = pyln.Meter(48000, "Fenton/Lee 2")
-ps_loudnesses = []
-for p in ps:
-    loudness = meter.integrated_loudness(p.apply_temp(reference_signal))
-    print(f"{p.name}: {loudness:.1f} LUFS")
-    ps_loudnesses.append(loudness)
-
-min_loudness = min(ps_loudnesses)
-for p, l in zip(ps, ps_loudnesses):
-    p.preamp_gain += min_loudness - l
-
 # Start the jack thread
-jack_client.peq_cfg = ps[0]
-jack_client.presets = ps
+jack_client.is_bypass = True
 t = threading.Thread(target=jack_client.start_jack)
 t.start()
 
@@ -102,6 +81,44 @@ jack_client.client_started_event.wait()
 sr = jack_client.client.samplerate
 for p in ps:
     p.change_sample_rate(sr)
+
+with jack_client.peq_cfg_lock:
+    jack_client.peq_cfg = copy.deepcopy(ps[0])
+    jack_client.presets = copy.deepcopy(ps)
+    jack_client.is_bypass = False
+
+NODE_AUTO_CONNECT = True
+if NODE_AUTO_CONNECT:
+    sinks = node_auto_connect.get_sinks()
+    old_default_sink = next(filter(lambda sink: sink.is_default, sinks))
+
+    # Create new pass-through sink
+    jack_client_name = jack_client.client.name
+    subprocess.run([
+        "pw-cli", "create-node", "adapter",
+        '{ factory.name=support.null-audio-sink '
+        f'node.name="{jack_client_name} Sink" '
+        f'node.description="{jack_client_name} Sink" '
+        'media.class=Audio/Sink object.linger=true audio.position=[ FL FR ] }'
+    ])
+
+    sinks = node_auto_connect.get_sinks()
+    new_default_sink = next(filter(lambda sink: sink.node_name == f"{jack_client_name} Sink", sinks))
+
+    # set new default sink
+    subprocess.run(["wpctl", "set-default", str(new_default_sink.id)])
+
+    jack_client_inports = node_auto_connect.get_input_ports_by_node_name(jack_client_name)
+    jack_client_outports = node_auto_connect.get_output_ports_by_node_name(jack_client_name)
+
+    new_default_sink_outports = node_auto_connect.get_output_ports_by_node_name(new_default_sink.node_name)
+    old_default_sink_inports = node_auto_connect.get_input_ports_by_node_name(old_default_sink.node_name)
+
+    for o, i in zip(new_default_sink_outports, jack_client_inports):
+        subprocess.run(["pw-link", str(o.id), str(i.id)])
+
+    for o, i in zip(jack_client_outports, old_default_sink_inports):
+        subprocess.run(["pw-link", str(o.id), str(i.id)])
 
 dpg.create_context()
 
@@ -122,13 +139,6 @@ with dpg.theme() as power_button_theme:
         dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (0, 100, 100, 0))
         power_button_text_color_prop = dpg.add_theme_color(dpg.mvThemeCol_Text, (255, 0, 0, 255))
 
-with dpg.theme() as power_button_on_theme:
-    with dpg.theme_component(dpg.mvAll):
-        dpg.add_theme_color(dpg.mvThemeCol_Button, (0, 128, 128, 0))
-        dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (0, 160, 160, 0))
-        dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (0, 100, 100, 0))
-        dpg.add_theme_color(dpg.mvThemeCol_Text, (0, 255, 0, 255))
-
 def button_callback(sender, app_data, user_data):
     global active_button
 
@@ -139,7 +149,9 @@ def button_callback(sender, app_data, user_data):
     active_button = sender
 
     with jack_client.peq_cfg_lock:
-        jack_client.peq_cfg = next(filter(lambda p: p.name == user_data, ps))
+        jack_client.peq_cfg = copy.deepcopy(
+            next(filter(lambda p: p.name == user_data, ps))
+        )
 
 def power_button_callback(sender, app_data, user_data):
     global is_bypass
@@ -167,11 +179,57 @@ def power_button_on_unhover(sender, app_data):
     else:
         dpg.configure_item(power_button_text_color_prop, value=(0, 0, 0, 255))
 
-def update_spacer_width():
-    viewport_width = dpg.get_viewport_width()
-    button_width = dpg.get_item_width("power_button")
-    spacer_width = viewport_width - button_width - 20
-    dpg.set_item_width("menu_bar_spacer", spacer_width * (spacer_width >= 0))
+def ch_swap_btn_switch_callback(sender, app_data, user_data):
+    new_state = not user_data
+    dpg.set_item_user_data(sender, new_state)
+    if new_state:
+        dpg.configure_item(sender, label="Channel Swap: ON")
+    else:
+        dpg.configure_item(sender, label="Channel Swap: OFF")
+
+    with jack_client.peq_cfg_lock:
+        jack_client.channel_swap = new_state
+
+def normalize_presets_btn_callback(sender, app_data, user_data):
+    #
+    # Now is the presets loudness matching. It is simplified/generalized version.
+    # It just compares loudness of the same noise but with different presets
+    # applied. After it preamp gains are lessened to match the quitest one. It's
+    # chosen because as by now program only works as equalizer that captures
+    # samples from the inports of the node, applies dsp to them and outputs them to
+    # the outports of the node. Noise is specified by it's tilt in dB/octave. -3 is
+    # pink noise, -4.5 is chosen as default because many popular music has tilt
+    # spectal tilt of -4.5 dB/octave. One can also experiment with filter class of
+    # `meter`: "K-weighting", "Fenton/Lee 1", etc.
+    #
+    noise_tilt = -4.5
+    fs = ps[0].fs
+    reference_signal = generate_tilted_noise(fs * 60, noise_tilt, fs)
+    meter = pyln.Meter(48000, "Fenton/Lee 2")
+    ps_loudnesses = []
+    for idx, p in enumerate(ps):
+        dpg.configure_item(
+            "normalize_presets_prog_bar", default_value=idx/len(ps),
+            overlay=f"{idx}/{len(ps)}"
+        )
+        loudness = meter.integrated_loudness(p.apply_temp(reference_signal))
+        print(f"{p.name}: {loudness:.1f} LUFS")
+        ps_loudnesses.append(loudness)
+
+    dpg.configure_item(
+        "normalize_presets_prog_bar", default_value=1.0,
+        overlay="Presets Normalized!"
+    )
+
+    min_loudness = min(ps_loudnesses)
+    for p, l in zip(ps, ps_loudnesses):
+        p.preamp_gain += min_loudness - l
+
+    with jack_client.peq_cfg_lock:
+        jack_client.presets = copy.deepcopy(ps)
+        jack_client.peq_cfg = copy.deepcopy(
+            next(filter(lambda p: p.name == jack_client.peq_cfg.name, ps))
+        )
 
 with dpg.font_registry():
     with dpg.font("/usr/share/fonts/TTF/BlexMonoNerdFont-Regular.ttf", 18) as nerd_font:
@@ -181,8 +239,13 @@ dpg.bind_font(nerd_font)
 
 with dpg.window(tag="Primary Window"):
     with dpg.menu_bar():
-        dpg.add_spacer(width=1, tag="menu_bar_spacer")
-        power_btn = dpg.add_button(label="⏻", tag="power_button", width=25, callback=power_button_callback)
+        power_btn = dpg.add_button(label="⏻", tag="power_button", callback=power_button_callback, small=True)
+        dpg.add_text("|")
+        dpg.add_button(
+            label="Channel Swap: OFF", user_data=False,
+            callback=ch_swap_btn_switch_callback,
+            tag="ch_swap_btn"
+        )
         dpg.bind_item_theme(power_btn, power_button_theme)
 
     for p in ps:
@@ -197,20 +260,25 @@ with dpg.window(tag="Primary Window"):
     active_button = radio_buttons[0]
     dpg.bind_item_theme(active_button, active_theme)
 
+    with dpg.group(horizontal=True):
+        dpg.add_button(
+            label="Normalize presets",
+            callback=normalize_presets_btn_callback
+        )
+        dpg.add_progress_bar(
+            default_value=0.0, width=-1,
+            tag="normalize_presets_prog_bar"
+        )
+
 with dpg.item_handler_registry() as handler_registry:
     dpg.add_item_hover_handler(callback=power_button_on_hover)
-    # dpg.add_item_visible_handler(callback=power_button_on_unhover)
 
 dpg.bind_item_handler_registry(power_btn, handler_registry)
 
 dpg.create_viewport(title='EQ Juggler', width=800, height=600,)
 dpg.setup_dearpygui()
 dpg.show_viewport()
-dpg.set_viewport_resize_callback(update_spacer_width)
 dpg.set_primary_window("Primary Window", True)
-
-update_spacer_width()
-
 
 while dpg.is_dearpygui_running():
     # If the button is no longer hovered, reset the color to white.
@@ -226,3 +294,7 @@ while dpg.is_dearpygui_running():
 dpg.destroy_context()
 jack_client.event.set()
 t.join()
+
+if NODE_AUTO_CONNECT:
+    subprocess.run(["pw-cli", "destroy", str(new_default_sink.id)])
+    subprocess.run(["wpctl", "set-default", str(old_default_sink.id)])

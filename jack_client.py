@@ -21,6 +21,7 @@ peq_cfg_lock = threading.RLock()
 presets: list[PEQConfig] | None = None
 client_started_event = threading.Event()
 is_bypass = False
+channel_swap = False
 
 
 def start_jack():
@@ -39,7 +40,10 @@ def start_jack():
     if client.status.server_started:
         print('JACK server started')
     if client.status.name_not_unique:
-        print(f'unique name {client.name!r} assigned')
+        raise RuntimeError(
+            f"Jack client name -- {clientname} -- is not unique. "
+            "It's an issue that needs to be fixed."
+        )
 
     event = threading.Event()
 
@@ -49,6 +53,7 @@ def start_jack():
         global peq_cfg_lock
         global presets
         global is_bypass
+        global channel_swap
 
         assert len(client.inports) == len(client.outports)
         assert frames == client.blocksize
@@ -60,7 +65,11 @@ def start_jack():
 
                 return
 
-            for idx, (i, o) in enumerate(zip(client.inports, client.outports)):
+            if channel_swap:
+                outports = client.outports[::-1]
+            else:
+                outports = client.outports
+            for idx, (i, o) in enumerate(zip(client.inports, outports)):
                 buf = i.get_array()
                 for p in presets:
                     new_buf, new_zi = p.apply_inplace(np.copy(buf), p.zi[idx])    # TODO
