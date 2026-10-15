@@ -22,6 +22,7 @@ presets: list[PEQConfig] | None = None
 client_started_event = threading.Event()
 is_bypass = False
 channel_swap = False
+gain_lin = 1
 
 
 def start_jack():
@@ -54,6 +55,7 @@ def start_jack():
         global presets
         global is_bypass
         global channel_swap
+        global gain_lin
 
         assert len(client.inports) == len(client.outports)
         assert frames == client.blocksize
@@ -73,13 +75,10 @@ def start_jack():
                 buf = i.get_array()
                 for p in presets:
                     new_buf, new_zi = p.apply_inplace(np.copy(buf), p.zi[idx])    # TODO
+                    new_buf *= gain_lin
                     if p.name == peq_cfg.name:
                         o.get_array()[:] = new_buf
                     p.zi[idx][:] = new_zi
-
-                # new_buf, new_zi = peq_cfg.apply_inplace(i.get_array(), channel_filters_zi)
-                # o.get_array()[:] = new_buf
-                # channel_filters_zi[:] = new_zi
 
 
     @client.set_shutdown_callback
