@@ -1,33 +1,34 @@
-#!/usr/bin/env python3
-
-"""Create a JACK client that copies input audio directly to the outputs.
-
-This is somewhat modeled after the "thru_client.c" example of JACK 2:
-http://github.com/jackaudio/jack2/blob/master/example-clients/thru_client.c
-
-If you have a microphone and loudspeakers connected, this might cause an
-acoustical feedback!
-
-"""
 import os
 import jack
 import threading
 import numpy as np
 
 from peq_config import PEQConfig
+from dataclasses import dataclass, field
+from utils import SingletonMeta
 
-peq_cfg: PEQConfig | None = None
-peq_cfg_lock = threading.RLock()
-presets: list[PEQConfig] | None = None
+
+@dataclass
+class JackSettings(metaclass=SingletonMeta):
+    lock: threading.RLock = threading.RLock()
+    current_eq_preset: PEQConfig | None = None
+    eq_presets: list[PEQConfig] = field(default_factory=list)
+    bypass: bool = False
+    swap_channels: bool = False
+    post_gain_lin: float = 1
+
+settings = JackSettings()
+client: jack.Client
+kill_jack_event = threading.Event()
+scratch_buf: np.ndarray
 client_started_event = threading.Event()
-is_bypass = False
-channel_swap = False
-gain_lin = 1
 
 
 def start_jack():
     global client
-    global event
+    global kill_jack_event
+    global settings
+    global scratch_buf
 
     clientname = "EQ Juggler"
     servername = None
@@ -38,47 +39,40 @@ def start_jack():
         clientname = f"{clientname}-{os.getpid()}"
         client = jack.Client(clientname, use_exact_name=True, servername=servername)
 
-    if client.status.server_started:
-        print('JACK server started')
     if client.status.name_not_unique:
         raise RuntimeError(
             f"Jack client name -- {clientname} -- is not unique. "
             "It's an issue that needs to be fixed."
         )
 
-    event = threading.Event()
-
     @client.set_process_callback
     def process(frames):
-        global peq_cfg
-        global peq_cfg_lock
-        global presets
-        global is_bypass
-        global channel_swap
-        global gain_lin
+        global settings
+        global client
+        global scratch_buf
 
         assert len(client.inports) == len(client.outports)
         assert frames == client.blocksize
 
-        with peq_cfg_lock:
-            if is_bypass:
+        with settings.lock:
+            if settings.bypass or settings.current_eq_preset is None:
                 for i, o in zip(client.inports, client.outports):
                     o.get_buffer()[:] = i.get_buffer()
-
                 return
 
-            if channel_swap:
+            if settings.swap_channels:
                 outports = client.outports[::-1]
             else:
                 outports = client.outports
+
             for idx, (i, o) in enumerate(zip(client.inports, outports)):
                 buf = i.get_array()
-                for p in presets:
-                    new_buf, new_zi = p.apply_inplace(np.copy(buf), p.zi[idx])    # TODO
-                    new_buf *= gain_lin
-                    if p.name == peq_cfg.name:
-                        o.get_array()[:] = new_buf
-                    p.zi[idx][:] = new_zi
+                for preset in settings.eq_presets:
+                    scratch_buf[:] = buf
+                    preset.apply_inplace(scratch_buf, preset.zi[idx])
+                    scratch_buf *= settings.post_gain_lin
+                    if preset.name == settings.current_eq_preset.name:
+                        o.get_array()[:] = scratch_buf
 
 
     @client.set_shutdown_callback
@@ -86,7 +80,7 @@ def start_jack():
         print('JACK shutdown!')
         print('status:', status)
         print('reason:', reason)
-        event.set()
+        kill_jack_event.set()
 
 
     @client.set_xrun_callback
@@ -94,43 +88,21 @@ def start_jack():
         print('xrun; delay', delay, 'microseconds')
 
 
-# create two port pairs
+    @client.set_blocksize_callback
+    def blocksize_callback(blocksize: int):
+        global scratch_buf
+        scratch_buf = np.empty(blocksize, np.float32)
+
+
     for number in 1, 2:
         client.inports.register(f'input_{number}')
         client.outports.register(f'output_{number}')
 
     with client:
-        # When entering this with-statement, client.activate() is called.
-        # This tells the JACK server that we are ready to roll.
-        # Our process() callback will start running now.
-
-        # Connect the ports.  You can't do this before the client is activated,
-        # because we can't make connections to clients that aren't running.
-        # Note the confusing (but necessary) orientation of the driver backend
-        # ports: playback ports are "input" to the backend, and capture ports
-        # are "output" from it.
-
         client_started_event.set()
-
-        capture = client.get_ports(is_physical=True, is_output=True)
-        if not capture:
-            raise RuntimeError('No physical capture ports')
-
-        # for src, dest in zip(capture, client.inports):
-        #     client.connect(src, dest)
-
-        playback = client.get_ports(is_physical=True, is_input=True)
-        if not playback:
-            raise RuntimeError('No physical playback ports')
-
-        # for src, dest in zip(client.outports, playback):
-        #     client.connect(src, dest)
+        scratch_buf = np.empty(client.blocksize, np.float32)
 
         try:
-            event.wait()
+            kill_jack_event.wait()
         except KeyboardInterrupt:
             print('\nInterrupted by user')
-
-# When the above with-statement is left (either because the end of the
-# code block is reached, or because an exception was raised inside),
-# client.deactivate() and client.close() are called automatically.

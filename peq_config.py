@@ -62,8 +62,6 @@ class PEQConfig:
 
         samples *= self._preamp_gain_lin
 
-        return (samples, filters_zi)
-
 
     def apply_temp(self, samples):
         new_samples = np.copy(samples)
@@ -73,7 +71,7 @@ class PEQConfig:
 
         filters_zi = np.array(filters_zi, np.float32)
 
-        new_samples, _ = self.apply_inplace(new_samples, filters_zi)
+        self.apply_inplace(new_samples, filters_zi)
         return new_samples
 
 

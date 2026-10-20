@@ -10,7 +10,7 @@ from pathlib import Path
 
 from peq_config import PEQConfig, ParametricFilter
 from units import dB
-from utils import lin_to_db, db_to_lin, biquad_derivative
+from utils import lin_to_db, db_to_lin
 import biquad_cookbook as rbj
 
 
