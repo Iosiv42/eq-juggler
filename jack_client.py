@@ -55,9 +55,10 @@ def start_jack():
         assert frames == client.blocksize
 
         with settings.lock:
-            if settings.bypass or settings.current_eq_preset is None:
+            if settings.bypass:
                 for i, o in zip(client.inports, client.outports):
                     o.get_buffer()[:] = i.get_buffer()
+
                 return
 
             if settings.swap_channels:
@@ -66,13 +67,15 @@ def start_jack():
                 outports = client.outports
 
             for idx, (i, o) in enumerate(zip(client.inports, outports)):
-                buf = i.get_array()
-                for preset in settings.eq_presets:
-                    scratch_buf[:] = buf
-                    preset.apply_inplace(scratch_buf, preset.zi[idx])
-                    scratch_buf *= settings.post_gain_lin
-                    if preset.name == settings.current_eq_preset.name:
-                        o.get_array()[:] = scratch_buf
+                scratch_buf[:] = i.get_array()
+                try:
+                    settings.current_eq_preset.apply_inplace_double(
+                        scratch_buf, settings.current_eq_preset.zi_double[idx]
+                    )
+                except AttributeError:
+                    pass
+                scratch_buf *= settings.post_gain_lin
+                o.get_array()[:] = scratch_buf
 
 
     @client.set_shutdown_callback

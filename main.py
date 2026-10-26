@@ -1,3 +1,4 @@
+from ast import Assert
 from PIL import Image
 import dearpygui.dearpygui as dpg
 import threading
@@ -6,6 +7,7 @@ import subprocess
 import time
 import random
 import jack
+from numpy.__config__ import show
 from scipy._external.array_api_extra import default_dtype
 
 import eq_apo_parser
@@ -19,10 +21,81 @@ import os
 import pystray
 from dataclasses import dataclass, field
 import crossfiledialog
+import pathlib
+import shutil
 
-from utils import SingletonMeta, db_to_lin, generate_tilted_noise, connect_program_nodes_to_patchbay
+from utils import SingletonMeta, db_to_lin, generate_tilted_noise, connect_program_nodes_to_patchbay, remove_forbidden_path_chars
 
 print(os.getpid())
+
+PRESETS_COMBO_SPECIAL_ITEMS = ("[No Preset]", "+ New", "+ From File")
+
+DEVICES_COMBO_SPECIAL_ITEMS = ("[No Device]", "+ New")
+
+app_path = pathlib.Path("~/.local/share/eq-juggler").expanduser()
+if not app_path.exists():
+    app_path.mkdir()
+
+@dataclass
+class Device:
+    name: str
+    presets: dict[str, PEQConfig] = field(default_factory=dict)
+    create_folder: bool = True
+
+    def __post_init__(self):
+        assert self.name != ""
+
+        self.name = remove_forbidden_path_chars(self.name)
+        self.path = app_path / "devices" / self.name
+
+        if self.create_folder:
+            self.path.mkdir()
+
+    def add_preset(self, preset: PEQConfig):
+        preset.name = remove_forbidden_path_chars(preset.name)
+
+        assert preset.name != ""
+        assert preset.name not in self.presets
+
+        self.presets[preset.name] = preset
+
+        with open(self.path / f"{preset.name}.txt", "w") as f:
+            f.write(preset.to_eq_apo())
+
+    def delete_preset(self, preset: PEQConfig):
+        del self.presets[preset.name]
+
+        (self.path / f"{preset.name}.txt").unlink()
+
+    def delete_from_storage(self):
+        shutil.rmtree(self.path)
+
+    def update_preset(self, preset):
+        assert preset.name in self.presets
+        self.presets[preset.name] = preset
+
+        with open(self.path / f"{preset.name}.txt", "w") as f:
+            f.write(preset.to_eq_apo())
+
+    def update_preset_name(self, old_name, new_name):
+        assert old_name in self.presets
+
+        new_name = remove_forbidden_path_chars(new_name)
+        self.presets[new_name] = self.presets.pop(old_name)
+        self.presets[new_name].name = new_name
+
+        (self.path / f"{old_name}.txt").move(self.path / f"{new_name}.txt")
+
+    def update_device_name(self, new_name):
+        new_name = remove_forbidden_path_chars(new_name)
+
+        new_path = app_path / "devices" / new_name
+        self.path.move(new_path)
+
+        self.name = new_name
+        self.path = new_path
+
+
 
 @dataclass
 class GUIState(metaclass=SingletonMeta):
@@ -33,78 +106,38 @@ class GUIState(metaclass=SingletonMeta):
     kill_dpg_event: threading.Event = threading.Event()
     presets: list[PEQConfig] = field(default_factory=list)
     next_free_preset_id: int = 0    # TODO
+    devices: dict[str, Device] = field(default_factory=dict)
+    current_device: Device | None = None
+    _current_preset: PEQConfig | None = None
 
-    def add_preset(self, preset: PEQConfig):
-        # TODO
-        idx = self.next_free_preset_id
-        with dpg.table_row(tag=f"presets_table_row_{idx}", parent="presets_table"):
-            btn = dpg.add_button(
-                label=preset.name, user_data=preset.name,
-                callback=preset_btn_callback,
-                width=-1, height=100,
-                tag=f"preset_btn_{idx}",
-            )
+    @property
+    def current_preset(self):
+        return self._current_preset
 
-            dpg.add_button(label="", width=100, height=100, user_data=idx)
-            dpg.add_button(label="󰆴", width=100, height=100, user_data=idx, callback=delete_preset_btn_callback)
-
-        self.presets.append(preset)
-        self.preset_btns.append(btn)
-        self.next_free_preset_id += 1
-
+    @current_preset.setter
+    def current_preset(self, new_preset: PEQConfig | None):
+        if new_preset is not None:
+            new_preset.reset_zi()
+        self._current_preset = new_preset
         with jack_client.settings.lock:
-            jack_client.settings.eq_presets.append(preset)
-
-    def delete_preset_by_name(self, preset_id: int):
-        dpg.delete_item(f"presets_table_row_{preset_id}")
-        for idx, preset_btn in enumerate(self.preset_btns):
-            if preset_btn == f"preset_btn_{preset_id}":
-                return (
-                    idx,
-                    self.presets.pop(idx),
-                    self.preset_btns.pop(idx),
-                )
+            jack_client.settings.current_eq_preset = copy.deepcopy(new_preset)
 
 
 gui_state = GUIState()
 
+devices_path = app_path / "devices"
+if not devices_path.exists():
+    devices_path.mkdir()
 
-#
-# First of all define eq presets as many as you want. The parameters are: path
-# or text of config; sample rate is unimportand because it will be changed
-# after jack client thread is started; and preset name that can be
-# automatically generated from path's name without extension. Then add them
-# manually to `ps`. First preset in `ps` will be set as default preset when
-# starting the app.
-#
+for device_entry in devices_path.iterdir():
+    if device_entry.is_dir():
+        device = Device(device_entry.name, create_folder=False)
+        gui_state.devices[device.name] = device
+        for preset_entry in device_entry.iterdir():
+            if preset_entry.is_file():
+                preset = eq_apo_parser.parse_eq_apo_config(preset_entry, 48000)
+                device.presets[preset.name] = preset
 
-p1 = eq_apo_parser.parse_eq_apo_config("/home/paro/Downloads/JT1/PEQdB Diamond Beta for KB501X.txt", 48000, "Diamond")
-p2 = eq_apo_parser.parse_eq_apo_config("/home/paro/Downloads/JT1/PEQdB Pref norm 02.10.2026.txt", 48000, "Pref norm")
-p3 = eq_apo_parser.parse_eq_apo_config("/home/paro/Downloads/JT1/PEQdB pref 10.10.2026.txt", 48000, "pref today")
-p4 = eq_apo_parser.parse_eq_apo_config("/home/paro/Downloads/JT1/PEQdB pref 2 10.10.2026.txt", 48000, "pref today 2")
-p5 = eq_apo_parser.parse_eq_apo_config("/home/paro/Downloads/JT1/avg peq pref 10.10.2026.txt", 48000, "avg pref")
-p6 = eq_apo_parser.parse_eq_apo_config("", 48000, "original")
-
-gui_state.presets = [p1, p2, p3, p4, p5, p6]
-
-# p1 = eq_apo_parser.parse_eq_apo_config("/home/paro/Downloads/Space Travel 2/peqdb diamond.txt", 48000, "Diamond")
-# p2 = eq_apo_parser.parse_eq_apo_config("/home/paro/Downloads/Space Travel 2/delta harman moa 2025.txt", 48000, "moa 2025")
-# p3 = eq_apo_parser.parse_eq_apo_config("/home/paro/Downloads/Space Travel 2/harman ie 2019.txt", 48000, "harman ie 2019")
-# p4 = eq_apo_parser.parse_eq_apo_config("/home/paro/Downloads/Space Travel 2/ief preference 2025.txt", 48000, "ief")
-# p5 = eq_apo_parser.parse_eq_apo_config("/home/paro/Downloads/Space Travel 2/JM-1 -10dB tilt.txt", 48000, "JM-1 tilt")
-# p6 = eq_apo_parser.parse_eq_apo_config("/home/paro/Downloads/Space Travel 2/JM-1 + Bass.txt", 48000, "JM-1 + Bass")
-# p7 = eq_apo_parser.parse_eq_apo_config("", 48000, "original")
-#
-# ps = [p1, p2, p3, p4, p5, p6, p7]
-
-# p1 = eq_apo_parser.parse_eq_apo_config("/home/paro/Downloads/final-audio-e500/h-ie-2019-precise.txt", 48000, "H IE 2019 precise")
-# p2 = eq_apo_parser.parse_eq_apo_config("/home/paro/Downloads/final-audio-e500/peqdb-diamond-kinda-precise.txt", 48000, "diamond kinda precise")
-# p3 = eq_apo_parser.parse_eq_apo_config("/home/paro/Downloads/final-audio-e500/JM-1.txt", 48000, "JM-1")
-# p4 = eq_apo_parser.parse_eq_apo_config("/home/paro/Downloads/final-audio-e500/JM-1 -10db tilt.txt", 48000, "JM-1 -10db tilt")
-# p5 = eq_apo_parser.parse_eq_apo_config("/home/paro/Downloads/final-audio-e500/JM-1 with bass.txt", 48000, "JM-1 with bass")
-# p6 = eq_apo_parser.parse_eq_apo_config("", 48000, "original")
-#
-# ps = [p1, p2, p3, p4, p5]
 
 # Start the jack thread
 jack_client.settings.bypass = True
@@ -114,12 +147,12 @@ t.start()
 # Change sample rate of presets to jack client's sample rate.
 jack_client.client_started_event.wait()
 sr = jack_client.client.samplerate
-for p in gui_state.presets:
-    p.change_sample_rate(sr)
+for d in gui_state.devices:
+    for p in gui_state.presets:
+        p.change_sample_rate(sr)
 
 with jack_client.settings.lock:
-    jack_client.settings.current_eq_preset = copy.deepcopy(gui_state.presets[0])
-    jack_client.settings.eq_presets = copy.deepcopy(gui_state.presets)
+    jack_client.settings.current_eq_preset = None
     jack_client.settings.bypass = False
 
 
@@ -128,20 +161,6 @@ if NODE_AUTO_CONNECT:
     old_default_sink, new_default_sink = \
         connect_program_nodes_to_patchbay(jack_client)
 
-
-def preset_btn_callback(sender, app_data, user_data):
-    global gui_state
-
-    if gui_state.active_preset_button is not None:
-        dpg.bind_item_theme(gui_state.active_preset_button, 0)
-
-    dpg.bind_item_theme(sender, "preset_btn_theme")
-    gui_state.active_preset_button = sender
-
-    with jack_client.settings.lock:
-        jack_client.settings.current_eq_preset = copy.deepcopy(
-            next(filter(lambda p: p.name == user_data, gui_state.presets))
-        )
 
 def bypass_btn_callback(sender, app_data, user_data):
     global gui_state
@@ -155,6 +174,7 @@ def bypass_btn_callback(sender, app_data, user_data):
     else:
         dpg.configure_item("bypass_btn", label="Bypass: OFF")
 
+
 def ch_swap_btn_callback(sender, app_data, user_data):
     new_state = not user_data
     dpg.set_item_user_data(sender, new_state)
@@ -166,46 +186,6 @@ def ch_swap_btn_callback(sender, app_data, user_data):
     with jack_client.settings.lock:
         jack_client.settings.swap_channels = new_state
 
-def normalize_presets_btn_callback(sender, app_data, user_data):
-    #
-    # Now is the presets loudness matching. It is simplified/generalized version.
-    # It just compares loudness of the same noise but with different presets
-    # applied. After it preamp gains are lessened to match the quitest one. It's
-    # chosen because as by now program only works as equalizer that captures
-    # samples from the inports of the node, applies dsp to them and outputs them to
-    # the outports of the node. Noise is specified by it's tilt in dB/octave. -3 is
-    # pink noise, -4.5 is chosen as default because many popular music has tilt
-    # spectal tilt of -4.5 dB/octave. One can also experiment with filter class of
-    # `meter`: "K-weighting", "Fenton/Lee 1", etc.
-    #
-    noise_tilt = -4.5
-    fs = gui_state.presets[0].fs
-    reference_signal = generate_tilted_noise(fs * 60, noise_tilt, fs)
-    meter = pyln.Meter(48000, "Fenton/Lee 2")
-    ps_loudnesses = []
-    for idx, p in enumerate(gui_state.presets):
-        dpg.configure_item(
-            "normalize_presets_prog_bar", default_value=idx/len(gui_state.presets),
-            overlay=f"{idx}/{len(gui_state.presets)}"
-        )
-        loudness = meter.integrated_loudness(p.apply_temp(reference_signal))
-        print(f"{p.name}: {loudness:.1f} LUFS")
-        ps_loudnesses.append(loudness)
-
-    dpg.configure_item(
-        "normalize_presets_prog_bar", default_value=1.0,
-        overlay="Presets Normalized!"
-    )
-
-    min_loudness = min(ps_loudnesses)
-    for p, l in zip(gui_state.presets, ps_loudnesses):
-        p.preamp_gain += min_loudness - l
-
-    with jack_client.settings.lock:
-        jack_client.settings.eq_presets = copy.deepcopy(gui_state.presets)
-        jack_client.settings.current_eq_preset = copy.deepcopy(
-            next(filter(lambda p: p.name == jack_client.settings.current_eq_preset.name, gui_state.presets))
-        )
 
 def global_gain_slider_callback(sender, app_data, user_data):
     with jack_client.settings.lock:
@@ -234,32 +214,287 @@ def change_tab_callback(sender, app_data, user_data):
         dpg.configure_item(tab_dpg_name, show=show)
 
 
-def add_preset_btn_callback(sender, app_data, user_data):
+def devices_combo_callback(sender, app_data, user_data):
     global gui_state
-    filename = crossfiledialog.open_file(title="Choose file with APO preset")
-    preset = eq_apo_parser.parse_eq_apo_config(filename, jack_client.client.samplerate)
-    gui_state.add_preset(preset)
+
+    if app_data == "+ New":
+        i = 1
+        while True:
+            try:
+                device = Device(f"Device #{i}")
+                gui_state.devices[device.name] = device
+                gui_state.current_device = device
+                break
+            except FileExistsError:
+                i += 1
+
+        device_items: list = dpg.get_item_configuration("devices_combo")["items"]
+        device_items.insert(len(DEVICES_COMBO_SPECIAL_ITEMS), device.name)
+        dpg.configure_item(
+            "devices_combo", items=device_items,
+            default_value=device.name,
+        )
+        dpg.set_value("device_name_input", device.name)
+        dpg.set_value("preset_name_input", "")
+
+        dpg.configure_item("control_panels_group", show=False)
+        dpg.configure_item("device_preset_name_inputs_group", show=True)
+        dpg.configure_item("preset_name_table_row", show=False)
+        dpg.configure_item("no_device_seleted_group", show=False)
+        dpg.configure_item("presets_combo_group", show=True)
+
+        presets_combo_callback(
+            "presets_combo", "[No Preset]",
+            dpg.get_item_user_data("presets_combo")
+        )
+
+        return
+
+    if app_data == "[No Device]":
+        gui_state.current_device = None
+        dpg.configure_item(
+            "presets_combo",
+            items=PRESETS_COMBO_SPECIAL_ITEMS,
+            default_value=PRESETS_COMBO_SPECIAL_ITEMS[0],
+        )
+        dpg.set_value("device_name_input", "")
+        dpg.set_value("preset_name_input", "")
+
+        dpg.configure_item("control_panels_group", show=False)
+        dpg.configure_item("device_preset_name_inputs_group", show=False)
+        dpg.configure_item("no_device_seleted_group", show=True)
+        dpg.configure_item("presets_combo_group", show=False)
+        return
+
+    gui_state.current_device = gui_state.devices[app_data]
+
+    preset_items = [name for name in gui_state.current_device.presets]
+    preset_items.extend(PRESETS_COMBO_SPECIAL_ITEMS)
+
+    default_value = preset_items[0]
+    dpg.configure_item("presets_combo", items=preset_items, default_value=default_value)
+    dpg.set_value("device_name_input", gui_state.current_device.name)
+
+    presets_combo_callback(
+        "presets_combo", default_value,
+        dpg.get_item_user_data("presets_combo")
+    )
+
+
+def presets_combo_callback(sender, app_data, user_data):
+    global gui_state
+
+    dpg.set_item_user_data(sender, app_data)
+    assert gui_state.current_device is not None
+
+    if app_data == "[No Preset]":
+        gui_state.current_preset = None
+        dpg.configure_item("no_device_seleted_group", show=False)
+        dpg.configure_item("device_preset_name_inputs_group", show=True)
+        dpg.configure_item("presets_combo_group", show=True)
+        dpg.configure_item("control_panels_group", show=False)
+        dpg.configure_item("preset_name_table_row", show=False)
+        return
+
+    default_value = app_data
+    if app_data == "+ From File":
+        path = crossfiledialog.open_file(title="Choose file with APO preset")
+        if path == "":
+            dpg.configure_item(sender, default_value=user_data)
+            return
+
+        try:
+            config = eq_apo_parser.parse_eq_apo_config(path, 48000)    # TODO fs
+        except SyntaxError:
+            dpg.configure_item(sender, default_value=user_data)
+            dpg.configure_item("eq_apo_parse_error_popup", show=True)
+            return
+
+        try:
+            gui_state.current_device.add_preset(config)
+        except AssertionError:
+            pass
+    elif app_data == "+ New":
+        i = 1
+        while True:
+            config = PEQConfig(f"Preset #{i}", 0, [], 48000)    # TODO fs
+            try:
+                gui_state.current_device.add_preset(config)
+                break
+            except AssertionError:
+                i += 1
+
+    if app_data in {"+ From File", "+ New"}:
+        preset_items = [name for name in gui_state.current_device.presets]
+        preset_items.extend(PRESETS_COMBO_SPECIAL_ITEMS)
+        default_value = config.name
+        dpg.configure_item("presets_combo", items=preset_items, default_value=default_value)
+
+    dpg.set_value("preset_name_input", default_value)
+    gui_state.current_preset = gui_state.current_device.presets[default_value]
+    dpg.set_value("eq_config_input", gui_state.current_preset.to_eq_apo())
+
+    dpg.configure_item("no_device_seleted_group", show=False)
+    dpg.configure_item("device_preset_name_inputs_group", show=True)
+    dpg.configure_item("presets_combo_group", show=True)
+    dpg.configure_item("control_panels_group", show=True)
+    dpg.configure_item("preset_name_table_row", show=True)
+
+
+def print_info_callback(sender, app_data, user_data):
+    print(f"sender: {sender}\napp_data: {repr(app_data)}\nuser_data: {user_data}")
+
+
+def preset_name_input_callback(sender, app_data, user_data):
+    global gui_state
+
+    assert gui_state.current_device is not None
+    assert gui_state.current_preset is not None
+
+    gui_state.current_device.update_preset_name(
+        gui_state.current_preset.name, app_data
+    )
+
+    preset_items = [name for name in gui_state.current_device.presets]
+    preset_items.extend(PRESETS_COMBO_SPECIAL_ITEMS)
+    dpg.configure_item(
+        "presets_combo", items=preset_items,
+        default_value=gui_state.current_preset.name
+    )
+
+
+def preset_name_save_btn_callback(sender, app_data, user_data):
+    tag = "preset_name_input"
+    preset_name_input_callback(
+        tag,
+        dpg.get_value(tag),
+        dpg.get_item_user_data(tag),
+    )
+
+
+def device_name_input_callback(sender, app_data, user_data):
+    global gui_state
+
+    assert gui_state.current_device is not None
+
+    old_name = gui_state.current_device.name
+    gui_state.current_device.update_device_name(app_data)
+    new_name = gui_state.current_device.name
+    gui_state.devices[new_name] = gui_state.devices.pop(old_name)
+
+    device_items = [name for name in gui_state.devices]
+    device_items.extend(DEVICES_COMBO_SPECIAL_ITEMS)
+    dpg.configure_item(
+        "devices_combo", items=device_items,
+        default_value=gui_state.current_device.name
+    )
+
+
+def device_name_save_btn_callback(sender, app_data, user_data):
+    tag = "device_name_input"
+    device_name_input_callback(
+        tag,
+        dpg.get_value(tag),
+        dpg.get_item_user_data(tag),
+    )
+
+
+def delete_device_btn_callback(sender, app_data, user_data):
+    global gui_state
+
+    assert gui_state.current_device is not None
+
+    gui_state.current_device.delete_from_storage()
+    gui_state.devices.pop(gui_state.current_device.name)
+
+    gui_state.current_preset = None
+    gui_state.current_device = None
+
+    tag = "devices_combo"
+    devices_combo_callback(
+        tag, "[No Device]",
+        dpg.get_item_user_data(tag)
+    )
+
+    device_items = [name for name in gui_state.devices]
+    device_items.extend(DEVICES_COMBO_SPECIAL_ITEMS)
+    dpg.configure_item(
+        "devices_combo", default_value="[No Device]",
+        items=device_items
+    )
+    dpg.configure_item("delete_device_popup", show=False)
 
 
 def delete_preset_btn_callback(sender, app_data, user_data):
     global gui_state
 
-    #TODO
-    if len(gui_state.preset_btns) == 1:
+    assert gui_state.current_device is not None
+    assert gui_state.current_preset is not None
+
+    gui_state.current_device.delete_preset(gui_state.current_preset)
+    gui_state.current_preset = None
+
+    tag = "presets_combo"
+    presets_combo_callback(
+        tag, "[No Preset]",
+        dpg.get_item_user_data(tag)
+    )
+
+    preset_items = [name for name in gui_state.current_device.presets]
+    preset_items.extend(PRESETS_COMBO_SPECIAL_ITEMS)
+    dpg.configure_item(
+        "presets_combo", default_value="[No Preset]",
+        items=preset_items
+    )
+    dpg.configure_item("delete_preset_popup", show=False)
+
+
+def save_preset_config_btn_callback(sender, app_data, user_data):
+    global gui_state
+
+    assert gui_state.current_preset is not None
+    assert gui_state.current_device is not None
+
+    config_text = dpg.get_value("eq_config_input")
+    try:
+        new_config = eq_apo_parser.parse_eq_apo_config(
+            config_text,
+            48000,    # TODO fs
+            gui_state.current_preset.name
+        )
+    except SyntaxError:
+        dpg.configure_item("eq_apo_parse_error_popup", show=True)
         return
 
-    id = user_data
-    idx, _, popped_btn = gui_state.delete_preset_by_name(id)
-    if gui_state.active_preset_button == popped_btn:
-        gui_state.active_preset_button = None
-        new_idx = idx if idx < len(gui_state.preset_btns) else idx - 1
-        preset_btn_callback(
-            gui_state.preset_btns[new_idx], None,
-            gui_state.presets[new_idx].name
-        )
+    gui_state.current_preset = new_config
+    gui_state.current_device.update_preset(new_config)
 
-    with jack_client.settings.lock:
-        jack_client.settings.eq_presets.pop(idx)
+
+def load_preset_config_btn_callback(sender, app_data, user_data):
+    global gui_state
+
+    assert gui_state.current_preset is not None
+    assert gui_state.current_device is not None
+
+    path = crossfiledialog.open_file(title="Choose file with APO preset")
+    if path == "":
+        return
+
+    try:
+        new_config = eq_apo_parser.parse_eq_apo_config(
+            path,
+            48000,    # TODO fs
+            gui_state.current_preset.name
+        )
+    except SyntaxError:
+        dpg.configure_item("eq_apo_parse_error_popup", show=True)
+        return
+
+    with open(path) as f:
+        dpg.set_value("eq_config_input", f.read())
+
+    gui_state.current_preset = new_config
+    gui_state.current_device.update_preset(new_config)
 
 
 def start_dpg():
@@ -295,51 +530,142 @@ def start_dpg():
         with dpg.child_window(border=False, no_scrollbar=True):
             with dpg.group(tag="presets_tab"):
                 with dpg.table(
-                    header_row=False, resizable=False, hideable=False,
-                    reorderable=False, borders_innerH=False,
-                    borders_innerV=False, borders_outerH=False,
-                    borders_outerV=False, row_background=False,
-                    policy=dpg.mvTable_SizingStretchProp,
-                    tag="presets_table"
+                    header_row=False, policy=dpg.mvTable_SizingStretchProp,
                 ):
-                    dpg.add_table_column(label="preset_name")
-                    dpg.add_table_column(label="edit_btn", width_fixed=True, init_width_or_weight=100)
-                    dpg.add_table_column(label="delete_btn", width_fixed=True, init_width_or_weight=100)
+                    dpg.add_table_column(label="device", init_width_or_weight=0.5)
+                    dpg.add_table_column(label="preset", init_width_or_weight=0.5)
 
-                    for idx, p in enumerate(gui_state.presets):
-                        with dpg.table_row(tag=f"presets_table_row_{idx}"):
-                            btn = dpg.add_button(
-                                label=p.name, user_data=p.name,
-                                callback=preset_btn_callback,
-                                width=-1, height=100,
-                                tag=f"preset_btn_{idx}",
+                    with dpg.table_row():
+                        with dpg.group(horizontal=True):
+                            device_items = [name for name in gui_state.devices]
+                            device_items.extend(DEVICES_COMBO_SPECIAL_ITEMS)
+                            dpg.add_text("Device:")
+                            dpg.add_combo(
+                                items=device_items, width=-1,
+                                callback=devices_combo_callback, tag="devices_combo",
+                                default_value=DEVICES_COMBO_SPECIAL_ITEMS[0],
                             )
 
-                            dpg.add_button(label="", width=100, height=100, user_data=idx)
-                            dpg.add_button(label="󰆴", width=100, height=100, user_data=idx, callback=delete_preset_btn_callback)
+                        with dpg.group(horizontal=True, tag="presets_combo_group", show=False):
+                            if gui_state.current_device is not None:
+                                preset_items = [name for name in gui_state.current_device.presets]
+                            else:
+                                preset_items = []
 
-                        gui_state.preset_btns.append(f"preset_btn_{idx}")
-                        gui_state.next_free_preset_id += 1
+                            preset_items.extend(PRESETS_COMBO_SPECIAL_ITEMS)
+                            dpg.add_text("Preset:")
+                            dpg.add_combo(
+                                items=preset_items, width=-1, tag="presets_combo",
+                                default_value=PRESETS_COMBO_SPECIAL_ITEMS[0],
+                                callback=presets_combo_callback,
+                                user_data=PRESETS_COMBO_SPECIAL_ITEMS[0]
+                            )
 
-                dpg.add_button(
-                    label="+", tag="add_preset_btn",
-                    callback=add_preset_btn_callback,
-                    width=-1, height=100
-                )
+                with dpg.group(tag="no_device_seleted_group"):
+                    dpg.add_spacer(height=2)
+                    dpg.add_separator()
+                    dpg.add_spacer(height=2)
+                    dpg.add_text("No Device Selected")
 
-                if gui_state.active_preset_button is None:
-                    gui_state.active_preset_button = gui_state.preset_btns[0]
-                dpg.bind_item_theme(gui_state.active_preset_button, "preset_btn_theme")
+                with dpg.group(tag="device_preset_name_inputs_group", show=False):
+                    dpg.add_spacer(height=2)
+                    dpg.add_separator()
+                    dpg.add_spacer(height=2)
 
-                with dpg.group(horizontal=True):
-                    dpg.add_button(
-                        label="Normalize presets",
-                        callback=normalize_presets_btn_callback
-                    )
-                    dpg.add_progress_bar(
-                        default_value=0.0, width=-1,
-                        tag="normalize_presets_prog_bar"
-                    )
+                    with dpg.table(
+                        header_row=False, policy=dpg.mvTable_SizingStretchProp
+                    ):
+                        dpg.add_table_column()
+                        dpg.add_table_column()
+                        dpg.add_table_column(width_fixed=True, init_width_or_weight=100)
+                        dpg.add_table_column(width_fixed=True, init_width_or_weight=100)
+
+                        with dpg.table_row():
+                            dpg.add_text("Device Name:")
+                            dpg.add_input_text(
+                                width=-1, hint="Empty...", on_enter=True,
+                                tag="device_name_input",
+                                callback=device_name_input_callback
+                            )
+                            dpg.add_button(
+                                label="Save", width=-1, tag="save_device_name_btn",
+                                callback=device_name_save_btn_callback,
+                            )
+                            dpg.add_button(
+                                label="Delete", width=-1, tag="delete_device_btn",
+                                callback=lambda: dpg.configure_item("delete_device_popup", show=True)
+                            )
+
+                        with dpg.table_row(tag="preset_name_table_row"):
+                            dpg.add_text("Preset Name:")
+                            dpg.add_input_text(
+                                width=-1, hint="Empty...",
+                                callback=preset_name_input_callback, on_enter=True,
+                                tag="preset_name_input",
+                            )
+                            dpg.add_button(
+                                label="Save", width=-1, tag="save_preset_name_btn",
+                                callback=preset_name_save_btn_callback
+                            )
+                            dpg.add_button(
+                                label="Delete", width=-1, tag="delete_preset_btn",
+                                callback=lambda: dpg.configure_item("delete_preset_popup", show=True)
+                            )
+
+                with dpg.group(tag="control_panels_group", show=False):
+                    dpg.add_spacer(height=2)
+                    dpg.add_separator()
+                    dpg.add_spacer(height=2)
+
+                    with dpg.collapsing_header(label="EQ Config"):
+                        dpg.add_input_text(
+                            multiline=True,
+                            width=-1, height=200,
+                            hint="Empty...",
+                            tag="eq_config_input"
+                        )
+                        with dpg.table(
+                            header_row=False, policy=dpg.mvTable_SizingStretchProp
+                        ):
+                            dpg.add_table_column(init_width_or_weight=0.5)
+                            dpg.add_table_column(init_width_or_weight=0.5)
+                            with dpg.table_row():
+                                dpg.add_button(
+                                    label="Save", width=-1,
+                                    callback=save_preset_config_btn_callback
+                                )
+                                dpg.add_button(
+                                    label="Load", width=-1,
+                                    callback=load_preset_config_btn_callback
+                                )
+
+                    dpg.add_spacer(height=2)
+                    dpg.add_separator()
+                    dpg.add_spacer(height=2)
+
+                    with dpg.collapsing_header(label="Channel Match (stub)"):
+                        with dpg.table(
+                            header_row=False,
+                            policy=dpg.mvTable_SizingStretchProp,
+                        ):
+                            dpg.add_table_column(label="Left", init_width_or_weight=0.5)
+                            dpg.add_table_column(label="Right", init_width_or_weight=0.5)
+
+                            with dpg.table_row():
+                                dpg.add_button(label="Left", width=-1)
+                                dpg.add_button(label="Right", width=-1)
+
+                            with dpg.table_row():
+                                dpg.add_input_text(
+                                    multiline=True,
+                                    height=200, hint="Empty...",
+                                    width=-1
+                                )
+                                dpg.add_input_text(
+                                    multiline=True,
+                                    height=200, hint="Empty...",
+                                    width=-1
+                                )
 
             with dpg.group(tag="control_tab"):
                 with dpg.group(horizontal=True):
@@ -359,6 +685,72 @@ def start_dpg():
                     user_data=(60, 50, 1.01)
                 )
 
+    with dpg.window(
+        tag="delete_device_popup",
+        modal=True,
+        show=False,
+        no_title_bar=True,
+        no_resize=True,
+        width=300,
+        height=300,
+    ):
+        dpg.add_text(
+            "Are you sure you want to delete this device "
+            "and all its presets?\nBe careful: after removal, "
+            "[No Device] mode will be set, and sound "
+            "may become louder!", wrap=0)
+        dpg.add_separator()
+
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Delete", callback=delete_device_btn_callback)
+            dpg.add_button(
+                label="Cancel",
+                callback=lambda: dpg.configure_item("delete_device_popup", show=False)
+            )
+
+    with dpg.window(
+        tag="delete_preset_popup",
+        modal=True,
+        show=False,
+        no_title_bar=True,
+        no_resize=True,
+        width=300,
+        height=300,
+    ):
+        dpg.add_text(
+            "Are you sure you want to delete this preset?\n"
+            "Be careful: after removal, "
+            "[No Preset] mode will be set, and sound "
+            "may become louder!", wrap=0
+        )
+        dpg.add_separator()
+
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Delete", callback=delete_preset_btn_callback)
+            dpg.add_button(
+                label="Cancel",
+                callback=lambda: dpg.configure_item("delete_preset_popup", show=False)
+            )
+
+    with dpg.window(
+        tag="eq_apo_parse_error_popup",
+        modal=True,
+        show=False,
+        no_title_bar=True,
+        no_resize=True,
+        width=300,
+        height=300,
+    ):
+        dpg.add_text(
+            "An error was occured when parsing EQ APO config", wrap=0
+        )
+        dpg.add_separator()
+
+        with dpg.group(horizontal=True):
+            dpg.add_button(
+                label="Close",
+                callback=lambda: dpg.configure_item("eq_apo_parse_error_popup", show=False)
+            )
 
     def mouse_wheel_callback(sender, app_data):
         if dpg.is_item_hovered("global_gain_slider"):
@@ -445,34 +837,12 @@ def quit_app_action(icon, item):
     gui_state.kill_dpg_event.set()
     icon.stop()
 
-def presets_tray_action(icon, item):
-    global gui_state, dpg_thread
-    if dpg_thread.is_alive():
-        preset_btn_callback(
-            next(filter(lambda b: dpg.get_item_user_data(b) == item.text, gui_state.preset_btns)),
-            None, item.text
-        )
-    else:
-        print(NotImplementedError(
-            "Preset is changed on Jack client level, but selected radio "
-            "button didn't changed in DearPyGui"
-        ))
-        with jack_client.settings.lock:
-            jack_client.settings.current_eq_preset = copy.deepcopy(
-                next(filter(lambda p: p.name == item.text, gui_state.presets))
-            )
-
 
 tray_icon = Image.open("./tray-icon.png") \
     .resize((64, 64), Image.Resampling.LANCZOS)
 
-presets_submenu = pystray.Menu(
-    *(pystray.MenuItem(p.name, presets_tray_action) for p in gui_state.presets)
-)
-
 menu = pystray.Menu(
     pystray.MenuItem("Show EQ Juggler", show_app_action),
-    pystray.MenuItem("▸ Presets", presets_submenu),
     pystray.MenuItem("Quit EQ Juggler", quit_app_action)
 )
 icon = pystray.Icon("EQ Juggler", tray_icon, "EQ Juggler", menu)

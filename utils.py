@@ -1,3 +1,4 @@
+from dataclasses import dataclass, field
 import numpy as np
 from units import dB
 import pipewire_utils
@@ -84,3 +85,7 @@ def connect_program_nodes_to_patchbay(jack_client):
     pipewire_utils.connect_nodes(jack_client_node_id, old_default_sink.id)
 
     return (old_default_sink, new_default_sink)
+
+
+def remove_forbidden_path_chars(path: str) -> str:
+    return path.replace("/", "⧸").replace("\0", "⧹0")

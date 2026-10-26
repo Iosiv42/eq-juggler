@@ -15,15 +15,26 @@ from utils import db_to_lin, lin_to_db
 # )
 
 clib_apply_peq = npct.load_library("./apply_peq.so", ".")
+
 clib_apply_peq.apply_inplace.argtypes = [
-    npct.ndpointer(dtype=np.float32, ndim=2, flags=("C", "W")),
-    npct.ndpointer(dtype=np.float32, ndim=2, flags=("C", "W")),
+    npct.ndpointer(dtype=np.float32, ndim=2, flags=("C",)),
+    npct.ndpointer(dtype=np.float32, ndim=2, flags=("C",)),
     npct.ndpointer(dtype=np.float32, ndim=1, flags=("C", "W")),
     npct.ndpointer(dtype=np.float32, ndim=2, flags=("C", "W")),
     ctypes.c_int,
     ctypes.c_int,
 ]
 clib_apply_peq.apply_inplace.restype = None
+
+clib_apply_peq.apply_inplace_double.argtypes = [
+    npct.ndpointer(dtype=np.float64, ndim=2, flags=("C",)),
+    npct.ndpointer(dtype=np.float64, ndim=2, flags=("C",)),
+    npct.ndpointer(dtype=np.float32, ndim=1, flags=("C", "W")),
+    npct.ndpointer(dtype=np.float64, ndim=2, flags=("C", "W")),
+    ctypes.c_int,
+    ctypes.c_int,
+]
+clib_apply_peq.apply_inplace_double.restype = None
 
 
 class PEQConfig:
@@ -36,18 +47,23 @@ class PEQConfig:
     ):
         self.name = name
         self.preamp_gain = preamp_gain
-        self._preamp_gain_lin = db_to_lin(preamp_gain)
-        self.filters = filters
+        self.filters = list(filter(lambda f: f.state, filters))
         self.change_sample_rate(fs)
-        self.zi = (
-            np.array([filter.zi for filter in self.filters], np.float32),
-            np.array([filter.zi for filter in self.filters], np.float32)
-        )
+        self.reset_zi()
+        # self.zi = (
+        #     np.array([filter.zi for filter in self.filters], np.float32),
+        #     np.array([filter.zi for filter in self.filters], np.float32)
+        # )
+        # self.zi_double = (
+        #     np.array([filter.zi for filter in self.filters], np.float64),
+        #     np.array([filter.zi for filter in self.filters], np.float64)
+        # )
 
 
     def change_sample_rate(self, fs: int):
         self.fs = fs
         self.filters_b, self.filters_a = self.calculate_filters_ba()
+        self.filters_b_double, self.filters_a_double = self.calculate_filters_ba_double()
 
 
     def apply_inplace(self, samples, filters_zi):
@@ -57,10 +73,23 @@ class PEQConfig:
                 samples, filters_zi,
                 len(self.filters), len(samples)
             )
-        except ctypes.ArgumentError:
+        except ctypes.ArgumentError as e:
             pass
 
         samples *= self._preamp_gain_lin
+
+
+    def apply_inplace_double(self, samples_float, filters_zi_double):
+        try:
+            clib_apply_peq.apply_inplace_double(
+                self.filters_b_double, self.filters_a_double,
+                samples_float, filters_zi_double,
+                len(self.filters), len(samples_float)
+            )
+        except ctypes.ArgumentError as e:
+            pass
+
+        samples_float *= self._preamp_gain_lin
 
 
     def apply_temp(self, samples):
@@ -78,6 +107,16 @@ class PEQConfig:
     def calculate_filters_ba(self):
         all_b = np.empty((len(self.filters), 3), np.float32)
         all_a = np.empty((len(self.filters), 3), np.float32)
+        for i, filter in enumerate(self.filters):
+            b, a = filter.calculate_ba(self.fs)
+            all_b[i] = b
+            all_a[i] = a
+
+        return (all_b, all_a)
+
+    def calculate_filters_ba_double(self):
+        all_b = np.empty((len(self.filters), 3), np.float64)
+        all_a = np.empty((len(self.filters), 3), np.float64)
         for i, filter in enumerate(self.filters):
             b, a = filter.calculate_ba(self.fs)
             all_b[i] = b
@@ -121,6 +160,18 @@ class PEQConfig:
 
         return maximum
 
+    def reset_zi(self):
+        zi_float = np.array(
+            [(0, 0) for f in self.filters],
+            np.float32
+        )
+        zi_double = np.array(
+            [(0, 0) for f in self.filters],
+            np.float64
+        )
+        self.zi = (zi_float.copy(), zi_float.copy())
+        self.zi_double = (zi_double.copy(), zi_double.copy())
+
 
     @property
     def preamp_gain(self):
@@ -128,8 +179,15 @@ class PEQConfig:
 
     @preamp_gain.setter
     def preamp_gain(self, new_gain: dB):
-        self._preamp_gain = new_gain
+        self._preamp_gain = round(new_gain, 2)
         self._preamp_gain_lin = db_to_lin(new_gain)
+
+    def to_eq_apo(self) -> str:
+        lines = [f"Preamp: {self.preamp_gain} dB"]
+        for filter in self.filters:
+            lines.append(filter.to_eq_apo())
+
+        return "\n".join(lines)
 
 
 @dataclass
@@ -140,6 +198,13 @@ class ParametricFilter:
     frequency: float
     gain: dB | None
     q: float | None
+
+    def __post_init__(self):
+        self.frequency = round(self.frequency)
+        if self.gain is not None:
+            self.gain = round(self.gain, 2)
+        if self.q is not None:
+            self.q = round(self.q, 3)
 
     def calculate_ba(self, fs):
         Wn = 2 * self.frequency / fs
@@ -180,6 +245,17 @@ class ParametricFilter:
         self.zi = signal.lfilter_zi(self.b, self.a)
         return (self.b, self.a)
 
+    def to_eq_apo(self) -> str:
+        state = "ON" if self.state else "OFF"
+        gain = self.gain if self.gain is not None else ""
+        q = self.q if self.q is not None else ""
+        ret = f"Filter {self.idx}: {state} {self.type} Fc {self.frequency} Hz"
+        if self.gain is not None:
+            ret += f" Gain {self.gain} dB"
+        if self.q is not None:
+            ret += f" Q {self.q}"
+
+        return ret
 
     def __q_to_s(self):
         A = 10 ** (self.gain / 40)
