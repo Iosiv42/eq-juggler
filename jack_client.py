@@ -16,12 +16,15 @@ class JackSettings(metaclass=SingletonMeta):
     bypass: bool = False
     swap_channels: bool = False
     post_gain_lin: float = 1
+    channel_match_eq: list[PEQConfig | None] = field(default_factory=lambda: [None, None])
+
 
 settings = JackSettings()
 client: jack.Client
 kill_jack_event = threading.Event()
 scratch_buf: np.ndarray
 client_started_event = threading.Event()
+sample_rate_changed_event = threading.Event()
 
 
 def start_jack():
@@ -68,12 +71,17 @@ def start_jack():
 
             for idx, (i, o) in enumerate(zip(client.inports, outports)):
                 scratch_buf[:] = i.get_array()
-                try:
-                    settings.current_eq_preset.apply_inplace_double(
-                        scratch_buf, settings.current_eq_preset.zi_double[idx]
-                    )
-                except AttributeError:
-                    pass
+
+                # General eq
+                eq = settings.current_eq_preset
+                if eq is not None:
+                    eq.apply_inplace_double(scratch_buf, eq.zi_double[idx])
+
+                # Channel match eq
+                eq = settings.channel_match_eq[idx]
+                if eq is not None:
+                    eq.apply_inplace_double(scratch_buf, eq.zi_double[idx])
+
                 scratch_buf *= settings.post_gain_lin
                 o.get_array()[:] = scratch_buf
 
@@ -95,6 +103,13 @@ def start_jack():
     def blocksize_callback(blocksize: int):
         global scratch_buf
         scratch_buf = np.empty(blocksize, np.float32)
+
+
+    @client.set_samplerate_callback
+    def samplerate_callback(sr: int):
+        global sample_rate_changed_event
+
+        sample_rate_changed_event.set()
 
 
     for number in 1, 2:

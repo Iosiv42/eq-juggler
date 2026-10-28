@@ -135,6 +135,7 @@ Filter 10: ON HSC Fc 14071 Hz Gain 2.80 dB Q 3.000"""
     # print(time.perf_counter() - ti)
     # print(filtered)
 
-    max_gain = apo_cfg.max_gain()
-    print(np.ceil(max_gain * 10) / 10)
-
+    max_gain = apo_cfg.max_gain(initial_bins_amount=8192)
+    max_gain_c = apo_cfg.max_gain_c(8192)
+    print(max_gain)
+    print(max_gain_c)

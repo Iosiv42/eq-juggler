@@ -36,6 +36,15 @@ clib_apply_peq.apply_inplace_double.argtypes = [
 ]
 clib_apply_peq.apply_inplace_double.restype = None
 
+clib_apply_peq.max_gain.argtypes = [
+    npct.ndpointer(dtype=np.float64, ndim=2, flags=("C",)),
+    npct.ndpointer(dtype=np.float64, ndim=2, flags=("C",)),
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_double,
+]
+clib_apply_peq.max_gain.restype = ctypes.c_double
+
 
 class PEQConfig:
     def __init__(
@@ -50,20 +59,13 @@ class PEQConfig:
         self.filters = list(filter(lambda f: f.state, filters))
         self.change_sample_rate(fs)
         self.reset_zi()
-        # self.zi = (
-        #     np.array([filter.zi for filter in self.filters], np.float32),
-        #     np.array([filter.zi for filter in self.filters], np.float32)
-        # )
-        # self.zi_double = (
-        #     np.array([filter.zi for filter in self.filters], np.float64),
-        #     np.array([filter.zi for filter in self.filters], np.float64)
-        # )
 
 
     def change_sample_rate(self, fs: int):
         self.fs = fs
         self.filters_b, self.filters_a = self.calculate_filters_ba()
         self.filters_b_double, self.filters_a_double = self.calculate_filters_ba_double()
+        self.reset_zi()
 
 
     def apply_inplace(self, samples, filters_zi):
@@ -137,28 +139,23 @@ class PEQConfig:
         return db_to_lin(mag_resp) * db_to_lin(self.preamp_gain)
 
 
-    def max_gain(self, *, initial_bins_amount: int = 65536) -> dB:
+    def max_gain(self, *, initial_bins_amount: int = 1024) -> dB:
         bins = np.linspace(0, self.fs, initial_bins_amount)
         mag_resp = self.magnitude_response(bins)
+        return mag_resp.max()
 
-        ranges_of_maximums = []
-        for i in range(1, len(mag_resp) - 1):
-            left = mag_resp[i - 1]
-            mid = mag_resp[i]
-            right = mag_resp[i + 1]
-
-            if left < mid and right < mid:
-                ranges_of_maximums.append((bins[i - 1], bins[i + 1]))
-
-        maximum = max(mag_resp)
-        for f1, f2 in ranges_of_maximums:
-            tmp_bins = np.linspace(f1, f2, 1024)
-            maximum = max(
-                maximum,
-                max(self.magnitude_response(tmp_bins))
+    def max_gain_c(self, freq_bins_count=1024) -> dB:
+        try:
+            res = clib_apply_peq.max_gain(
+                self.filters_b_double, self.filters_a_double,
+                len(self.filters), freq_bins_count,
+                self._preamp_gain
             )
+        except ctypes.ArgumentError as e:
+            print(e)
+            res = self._preamp_gain
 
-        return maximum
+        return res
 
     def reset_zi(self):
         zi_float = np.array(

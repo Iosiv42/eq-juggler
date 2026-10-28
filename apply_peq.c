@@ -1,4 +1,11 @@
+#include <stdio.h>
 #include <sys/types.h>
+#include <complex.h>
+#include <stdlib.h>
+#include <float.h>
+
+#define _USE_MATH_DEFINES
+#include <math.h>
 
 __attribute__((visibility("default")))
 void apply_inplace(
@@ -79,4 +86,71 @@ void apply_inplace_double(
     k_3 += 3;
     k_2 += 2;
   }
+}
+
+
+__attribute__((visibility("default")))
+double max_gain(
+  const double* __restrict all_b,
+  const double* __restrict all_a,
+  uint filters_count,
+  uint freq_bins_count,
+  double preamp_gain_db
+) {
+  double 
+    a0, a1, a2,
+    b0, b1, b2;
+
+  double *mag_sq = malloc(freq_bins_count * sizeof(double));
+  double *k1_cache = malloc(freq_bins_count * sizeof(double));
+  double *k2_cache = malloc(freq_bins_count * sizeof(double));
+
+  double w = 0, inc = M_PI/(freq_bins_count - 1);
+  for (uint i = 0; i < freq_bins_count; i++) {
+    mag_sq[i] = 1.0;
+
+    double k = 1 - cos(w);
+    k1_cache[i] = k;
+    k2_cache[i] = k*k;
+
+    w += inc;
+  }
+
+  for (uint i = 0; i < 3*filters_count; i += 3) {
+    a0 = all_a[i];
+    a1 = all_a[i + 1];
+    a2 = all_a[i + 2];
+
+    b0 = all_b[i];
+    b1 = all_b[i + 1];
+    b2 = all_b[i + 2];
+
+    double
+      n_c0 = (b0 + b1 + b2) * (b0 + b1 + b2),
+      n_c1 = 2 * (b0*b1 + b1*b2 + 4*b0*b2),
+      n_c2 = 4*b0*b2,
+
+      d_c0 = (a0 + a1 + a2) * (a0 + a1 + a2),
+      d_c1 = 2 * (a0*a1 + a1*a2 + 4*a0*a2),
+      d_c2 = 4*a0*a2;
+
+    for (uint j = 0; j < freq_bins_count; j++) {
+      double k1 = k1_cache[j], k2 = k2_cache[j];
+      mag_sq[j] *= 
+        (n_c0 - n_c1*k1 + n_c2*k2) / (d_c0 - d_c1*k1 + d_c2*k2);
+    }
+  }
+
+  double max_sq = DBL_MIN, val;
+  for (uint i = 0; i < freq_bins_count; i++) {
+    val = mag_sq[i];
+    if (val > max_sq) {
+      max_sq = val;
+    }
+  }
+
+  free(mag_sq);
+  mag_sq = NULL;
+
+  return 10*log10(max_sq) + preamp_gain_db;
 }
